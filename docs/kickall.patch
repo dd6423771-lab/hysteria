@@ -1,0 +1,312 @@
+diff --git a/.github/workflows/kickall-build.yml b/.github/workflows/kickall-build.yml
+new file mode 100644
+index 0000000..4497333
+--- /dev/null
++++ b/.github/workflows/kickall-build.yml
+@@ -0,0 +1,56 @@
++name: "Build linux-amd64 (kickall)"
++
++on:
++  push:
++    branches:
++      - "feat/hy2-kickall-*"
++  workflow_dispatch:
++
++jobs:
++  build:
++    name: Build linux-amd64
++    runs-on: ubuntu-latest
++    steps:
++      - name: Check out
++        uses: actions/checkout@v7
++
++      - name: Setup Go
++        uses: actions/setup-go@v7
++        with:
++          go-version: "1.26"
++
++      - name: Compile check (all modules)
++        run: |
++          for m in core extras app; do
++            (cd "$m" && go build ./...)
++          done
++
++      - name: Build linux-amd64
++        env:
++          HY_APP_VERSION: v2.13.0-kickall
++          HY_APP_COMMIT: ${{ github.sha }}
++        run: |
++          mkdir -p build
++          APP_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
++          (cd app && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../build/hysteria-linux-amd64 \
++            -trimpath \
++            -ldflags "-s -w \
++              -X github.com/apernet/hysteria/app/v2/cmd.appVersion=$HY_APP_VERSION \
++              -X github.com/apernet/hysteria/app/v2/cmd.appDate=$APP_DATE \
++              -X github.com/apernet/hysteria/app/v2/cmd.appType=release \
++              -X github.com/apernet/hysteria/app/v2/cmd.appCommit=$HY_APP_COMMIT \
++              -X github.com/apernet/hysteria/app/v2/cmd.appPlatform=linux \
++              -X github.com/apernet/hysteria/app/v2/cmd.appArch=amd64" \
++            .)
++          go version > build/go-version.txt
++          echo "commit: $HY_APP_COMMIT" >> build/go-version.txt
++          sha256sum build/hysteria-linux-amd64 | tee build/sha256.txt
++
++      - name: Upload artifact
++        uses: actions/upload-artifact@v7
++        with:
++          name: hysteria-linux-amd64-kickall-${{ github.sha }}
++          path: |
++            build/hysteria-linux-amd64
++            build/sha256.txt
++            build/go-version.txt
+diff --git a/app/cmd/server.go b/app/cmd/server.go
+index 064804e..d7206b7 100644
+--- a/app/cmd/server.go
++++ b/app/cmd/server.go
+@@ -1497,6 +1497,9 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
+ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
+ 	if c.TrafficStats.Listen != "" {
+ 		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
++		// Enable the POST /kickall endpoint by attaching a connection registry.
++		hyConfig.ConnRegistry = server.NewConnRegistry()
++		tss.SetConnRegistry(hyConfig.ConnRegistry)
+ 		hyConfig.TrafficLogger = tss
+ 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
+ 	}
+diff --git a/core/server/config.go b/core/server/config.go
+index 1cf8bd3..ec7fd25 100644
+--- a/core/server/config.go
++++ b/core/server/config.go
+@@ -40,6 +40,7 @@ type Config struct {
+ 	Authenticator         Authenticator
+ 	EventLogger           EventLogger
+ 	TrafficLogger         TrafficLogger
++	ConnRegistry          *ConnRegistry
+ 	MasqHandler           http.Handler
+ }
+ 
+diff --git a/core/server/connregistry.go b/core/server/connregistry.go
+new file mode 100644
+index 0000000..66b80c2
+--- /dev/null
++++ b/core/server/connregistry.go
+@@ -0,0 +1,96 @@
++package server
++
++import (
++	"sync"
++
++	"github.com/apernet/quic-go"
++)
++
++// ConnRegistry tracks authenticated QUIC connections by auth id.
++// It allows an operator (e.g. a traffic stats API endpoint) to immediately
++// close all existing connections of a user, including idle ones, without
++// leaving any one-shot kick marks behind.
++//
++// The zero value is not usable; use NewConnRegistry.
++type ConnRegistry struct {
++	mu sync.Mutex
++	m  map[string]map[*quic.Conn]struct{}
++}
++
++func NewConnRegistry() *ConnRegistry {
++	return &ConnRegistry{m: make(map[string]map[*quic.Conn]struct{})}
++}
++
++// Register adds an authenticated connection under the given auth id.
++// It is a no-op if the registry is nil.
++func (r *ConnRegistry) Register(id string, conn *quic.Conn) {
++	if r == nil {
++		return
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	conns, ok := r.m[id]
++	if !ok {
++		conns = make(map[*quic.Conn]struct{})
++		r.m[id] = conns
++	}
++	conns[conn] = struct{}{}
++}
++
++// Unregister removes a connection from the registry (on disconnect).
++// It is a no-op if the registry is nil.
++func (r *ConnRegistry) Unregister(id string, conn *quic.Conn) {
++	if r == nil {
++		return
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	conns, ok := r.m[id]
++	if !ok {
++		return
++	}
++	delete(conns, conn)
++	if len(conns) == 0 {
++		delete(r.m, id)
++	}
++}
++
++// CloseAll immediately closes all existing connections of the given auth id
++// with the provided application error code. It returns the number of
++// connections that were closed. Closed connections are removed from the
++// registry. It does NOT create any one-shot kick marks; connections
++// authenticated after this call are unaffected.
++// It is a no-op returning 0 if the registry is nil.
++func (r *ConnRegistry) CloseAll(id string, code quic.ApplicationErrorCode) int {
++	if r == nil {
++		return 0
++	}
++	r.mu.Lock()
++	conns, ok := r.m[id]
++	if !ok {
++		r.mu.Unlock()
++		return 0
++	}
++	// Take ownership of the set and remove it from the registry,
++	// so that new registrations during Close are not affected.
++	delete(r.m, id)
++	r.mu.Unlock()
++
++	n := 0
++	for conn := range conns {
++		_ = conn.CloseWithError(code, "")
++		n++
++	}
++	return n
++}
++
++// Count returns the number of tracked connections for the given auth id.
++// It is a no-op returning 0 if the registry is nil.
++func (r *ConnRegistry) Count(id string) int {
++	if r == nil {
++		return 0
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return len(r.m[id])
++}
+diff --git a/core/server/server.go b/core/server/server.go
+index c3fb6d7..b3eebd8 100644
+--- a/core/server/server.go
++++ b/core/server/server.go
+@@ -24,6 +24,11 @@ const (
+ 	closeErrCodeTrafficLimitReached = 0x107 // HTTP3 ErrCodeExcessiveLoad
+ )
+ 
++// CloseErrCodeTrafficLimitReached is the exported application error code used
++// when connections are closed on operator request (one-shot /kick or registry
++// based /kickall). Clients see it as "traffic limit reached".
++const CloseErrCodeTrafficLimitReached = closeErrCodeTrafficLimitReached
++
+ type Server interface {
+ 	Serve() error
+ 	Close() error
+@@ -130,6 +135,7 @@ func (s *serverImpl) handleClient(conn *quic.Conn) {
+ 	err := h3s.ServeQUICConn(conn)
+ 	// If the client is authenticated, we need to log the disconnect event
+ 	if handler.authenticated {
++		s.config.ConnRegistry.Unregister(handler.authID, conn)
+ 		if tl := s.config.TrafficLogger; tl != nil {
+ 			tl.LogOnlineState(handler.authID, false)
+ 		}
+@@ -210,6 +216,9 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 			if tl := h.config.TrafficLogger; tl != nil {
+ 				tl.LogOnlineState(id, true)
+ 			}
++			// Track the connection in the registry (if enabled), so that
++			// all existing connections of this user can be closed on demand.
++			h.config.ConnRegistry.Register(id, h.conn)
+ 			if el := h.config.EventLogger; el != nil {
+ 				el.Connect(h.conn.RemoteAddr(), id, actualTx)
+ 			}
+diff --git a/extras/trafficlogger/http.go b/extras/trafficlogger/http.go
+index b6d9597..f29f1ac 100644
+--- a/extras/trafficlogger/http.go
++++ b/extras/trafficlogger/http.go
+@@ -23,6 +23,9 @@ const (
+ type TrafficStatsServer interface {
+ 	server.TrafficLogger
+ 	http.Handler
++	// SetConnRegistry attaches a connection registry, enabling the
++	// POST /kickall endpoint. May be nil (endpoint then reports 501).
++	SetConnRegistry(reg *server.ConnRegistry)
+ }
+ 
+ func NewTrafficStatsServer(secret string) TrafficStatsServer {
+@@ -36,12 +39,13 @@ func NewTrafficStatsServer(secret string) TrafficStatsServer {
+ }
+ 
+ type trafficStatsServerImpl struct {
+-	Mutex     sync.RWMutex
+-	StatsMap  map[string]*trafficStatsEntry
+-	OnlineMap map[string]int
+-	StreamMap map[server.HyStream]*server.StreamStats
+-	KickMap   map[string]struct{}
+-	Secret    string
++	Mutex        sync.RWMutex
++	StatsMap     map[string]*trafficStatsEntry
++	OnlineMap    map[string]int
++	StreamMap    map[server.HyStream]*server.StreamStats
++	KickMap      map[string]struct{}
++	Secret       string
++	ConnRegistry *server.ConnRegistry
+ }
+ 
+ type trafficStatsEntry struct {
+@@ -116,6 +120,10 @@ func (s *trafficStatsServerImpl) ServeHTTP(w http.ResponseWriter, r *http.Reques
+ 		s.kick(w, r)
+ 		return
+ 	}
++	if r.Method == http.MethodPost && r.URL.Path == "/kickall" {
++		s.kickAll(w, r)
++		return
++	}
+ 	if r.Method == http.MethodGet && r.URL.Path == "/online" {
+ 		s.getOnline(w, r)
+ 		return
+@@ -297,3 +305,42 @@ func (s *trafficStatsServerImpl) kick(w http.ResponseWriter, r *http.Request) {
+ 
+ 	w.WriteHeader(http.StatusOK)
+ }
++
++// SetConnRegistry attaches a connection registry for the /kickall endpoint.
++func (s *trafficStatsServerImpl) SetConnRegistry(reg *server.ConnRegistry) {
++	s.ConnRegistry = reg
++}
++
++type kickAllResult struct {
++	ID     string `json:"id"`
++	Closed int    `json:"closed"`
++}
++
++type kickAllResponse struct {
++	Total   int             `json:"total"`
++	Results []kickAllResult `json:"results"`
++}
++
++// kickAll immediately closes all existing connections of the given auth ids.
++// Unlike /kick, it does not leave any one-shot marks in the KickMap, so
++// connections authenticated after this call are never affected.
++func (s *trafficStatsServerImpl) kickAll(w http.ResponseWriter, r *http.Request) {
++	if s.ConnRegistry == nil {
++		http.Error(w, "connection registry not configured", http.StatusNotImplemented)
++		return
++	}
++	var ids []string
++	err := json.NewDecoder(r.Body).Decode(&ids)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadRequest)
++		return
++	}
++	resp := kickAllResponse{Results: make([]kickAllResult, 0, len(ids))}
++	for _, id := range ids {
++		n := s.ConnRegistry.CloseAll(id, server.CloseErrCodeTrafficLimitReached)
++		resp.Results = append(resp.Results, kickAllResult{ID: id, Closed: n})
++		resp.Total += n
++	}
++	w.Header().Set("Content-Type", "application/json; charset=utf-8")
++	_ = json.NewEncoder(w).Encode(&resp)
++}
