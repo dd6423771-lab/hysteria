@@ -1497,6 +1497,9 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	if c.TrafficStats.Listen != "" {
 		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
+		// Enable the POST /kickall endpoint by attaching a connection registry.
+		hyConfig.ConnRegistry = server.NewConnRegistry()
+		tss.SetConnRegistry(hyConfig.ConnRegistry)
 		hyConfig.TrafficLogger = tss
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
 	}

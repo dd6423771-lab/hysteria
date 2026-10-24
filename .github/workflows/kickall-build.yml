@@ -1,0 +1,56 @@
+name: "Build linux-amd64 (kickall)"
+
+on:
+  push:
+    branches:
+      - "feat/hy2-kickall-*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build linux-amd64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+
+      - name: Compile check (all modules)
+        run: |
+          for m in core extras app; do
+            (cd "$m" && go build ./...)
+          done
+
+      - name: Build linux-amd64
+        env:
+          HY_APP_VERSION: v2.13.0-kickall
+          HY_APP_COMMIT: ${{ github.sha }}
+        run: |
+          mkdir -p build
+          APP_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          (cd app && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../build/hysteria-linux-amd64 \
+            -trimpath \
+            -ldflags "-s -w \
+              -X github.com/apernet/hysteria/app/v2/cmd.appVersion=$HY_APP_VERSION \
+              -X github.com/apernet/hysteria/app/v2/cmd.appDate=$APP_DATE \
+              -X github.com/apernet/hysteria/app/v2/cmd.appType=release \
+              -X github.com/apernet/hysteria/app/v2/cmd.appCommit=$HY_APP_COMMIT \
+              -X github.com/apernet/hysteria/app/v2/cmd.appPlatform=linux \
+              -X github.com/apernet/hysteria/app/v2/cmd.appArch=amd64" \
+            .)
+          go version > build/go-version.txt
+          echo "commit: $HY_APP_COMMIT" >> build/go-version.txt
+          sha256sum build/hysteria-linux-amd64 | tee build/sha256.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: hysteria-linux-amd64-kickall-${{ github.sha }}
+          path: |
+            build/hysteria-linux-amd64
+            build/sha256.txt
+            build/go-version.txt

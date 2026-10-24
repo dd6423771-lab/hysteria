@@ -40,6 +40,7 @@ type Config struct {
 	Authenticator         Authenticator
 	EventLogger           EventLogger
 	TrafficLogger         TrafficLogger
+	ConnRegistry          *ConnRegistry
 	MasqHandler           http.Handler
 }
 

@@ -24,6 +24,11 @@ const (
 	closeErrCodeTrafficLimitReached = 0x107 // HTTP3 ErrCodeExcessiveLoad
 )
 
+// CloseErrCodeTrafficLimitReached is the exported application error code used
+// when connections are closed on operator request (one-shot /kick or registry
+// based /kickall). Clients see it as "traffic limit reached".
+const CloseErrCodeTrafficLimitReached = closeErrCodeTrafficLimitReached
+
 type Server interface {
 	Serve() error
 	Close() error
@@ -130,6 +135,7 @@ func (s *serverImpl) handleClient(conn *quic.Conn) {
 	err := h3s.ServeQUICConn(conn)
 	// If the client is authenticated, we need to log the disconnect event
 	if handler.authenticated {
+		s.config.ConnRegistry.Unregister(handler.authID, conn)
 		if tl := s.config.TrafficLogger; tl != nil {
 			tl.LogOnlineState(handler.authID, false)
 		}
@@ -210,6 +216,9 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if tl := h.config.TrafficLogger; tl != nil {
 				tl.LogOnlineState(id, true)
 			}
+			// Track the connection in the registry (if enabled), so that
+			// all existing connections of this user can be closed on demand.
+			h.config.ConnRegistry.Register(id, h.conn)
 			if el := h.config.EventLogger; el != nil {
 				el.Connect(h.conn.RemoteAddr(), id, actualTx)
 			}

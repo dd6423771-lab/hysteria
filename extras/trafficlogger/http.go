@@ -23,6 +23,9 @@ const (
 type TrafficStatsServer interface {
 	server.TrafficLogger
 	http.Handler
+	// SetConnRegistry attaches a connection registry, enabling the
+	// POST /kickall endpoint. May be nil (endpoint then reports 501).
+	SetConnRegistry(reg *server.ConnRegistry)
 }
 
 func NewTrafficStatsServer(secret string) TrafficStatsServer {
@@ -36,12 +39,13 @@ func NewTrafficStatsServer(secret string) TrafficStatsServer {
 }
 
 type trafficStatsServerImpl struct {
-	Mutex     sync.RWMutex
-	StatsMap  map[string]*trafficStatsEntry
-	OnlineMap map[string]int
-	StreamMap map[server.HyStream]*server.StreamStats
-	KickMap   map[string]struct{}
-	Secret    string
+	Mutex        sync.RWMutex
+	StatsMap     map[string]*trafficStatsEntry
+	OnlineMap    map[string]int
+	StreamMap    map[server.HyStream]*server.StreamStats
+	KickMap      map[string]struct{}
+	Secret       string
+	ConnRegistry *server.ConnRegistry
 }
 
 type trafficStatsEntry struct {
@@ -114,6 +118,10 @@ func (s *trafficStatsServerImpl) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	if r.Method == http.MethodPost && r.URL.Path == "/kick" {
 		s.kick(w, r)
+		return
+	}
+	if r.Method == http.MethodPost && r.URL.Path == "/kickall" {
+		s.kickAll(w, r)
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == "/online" {
@@ -296,4 +304,43 @@ func (s *trafficStatsServerImpl) kick(w http.ResponseWriter, r *http.Request) {
 	s.Mutex.Unlock()
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// SetConnRegistry attaches a connection registry for the /kickall endpoint.
+func (s *trafficStatsServerImpl) SetConnRegistry(reg *server.ConnRegistry) {
+	s.ConnRegistry = reg
+}
+
+type kickAllResult struct {
+	ID     string `json:"id"`
+	Closed int    `json:"closed"`
+}
+
+type kickAllResponse struct {
+	Total   int             `json:"total"`
+	Results []kickAllResult `json:"results"`
+}
+
+// kickAll immediately closes all existing connections of the given auth ids.
+// Unlike /kick, it does not leave any one-shot marks in the KickMap, so
+// connections authenticated after this call are never affected.
+func (s *trafficStatsServerImpl) kickAll(w http.ResponseWriter, r *http.Request) {
+	if s.ConnRegistry == nil {
+		http.Error(w, "connection registry not configured", http.StatusNotImplemented)
+		return
+	}
+	var ids []string
+	err := json.NewDecoder(r.Body).Decode(&ids)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp := kickAllResponse{Results: make([]kickAllResult, 0, len(ids))}
+	for _, id := range ids {
+		n := s.ConnRegistry.CloseAll(id, server.CloseErrCodeTrafficLimitReached)
+		resp.Results = append(resp.Results, kickAllResult{ID: id, Closed: n})
+		resp.Total += n
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(&resp)
 }
